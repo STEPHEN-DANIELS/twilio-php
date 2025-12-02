@@ -1,0 +1,782 @@
+<?php
+/**
+ * Bulk SMS Sender PHP Script
+ * Supports: Twilio, Africa's Talking, Hubtel, SMSGh, Generic HTTP API
+ */
+
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// Configuration for different SMS providers
+$config = [
+    'twilio' => [
+        'account_sid' => 'YOUR_TWILIO_ACCOUNT_SID',
+        'auth_token' => 'YOUR_TWILIO_AUTH_TOKEN',
+        'from_number' => '+1234567890',
+        'enabled' => false
+    ],
+    
+    'africas_talking' => [
+        'api_key' => 'YOUR_API_KEY',
+        'username' => 'YOUR_USERNAME',
+        'from' => 'YOUR_SENDER_ID',
+        'enabled' => false
+    ],
+    
+    'hubtel' => [
+        'client_id' => 'YOUR_CLIENT_ID',
+        'client_secret' => 'YOUR_CLIENT_SECRET',
+        'sender_id' => 'YOUR_SENDER_ID',
+        'enabled' => false
+    ],
+    
+    'generic' => [
+        'url' => 'https://your-sms-provider.com/api/send',
+        'api_key' => 'YOUR_API_KEY',
+        'method' => 'POST', // POST or GET
+        'enabled' => false
+    ]
+];
+
+// Sample recipient list (you can load from database or CSV)
+$sampleRecipients = [
+    '+233240857649' => 'Kwame Mensah',
+    '+233274987654' => 'Ama Serwaa',
+    '+233546112233' => 'Kofi Annan',
+    '+233200654321' => 'Esi Boateng'
+];
+
+// Initialize variables
+$results = [];
+$successCount = 0;
+$failedCount = 0;
+
+// Check if form is submitted
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Get form data
+    $provider = $_POST['provider'] ?? 'generic';
+    $message = trim($_POST['message'] ?? '');
+    $recipientsInput = trim($_POST['recipients'] ?? '');
+    
+    // Process recipients (can be comma, newline, or space separated)
+    $recipients = [];
+    if ($recipientsInput) {
+        // Replace multiple delimiters with comma
+        $recipientsInput = preg_replace('/[\n\r\s]+/', ',', $recipientsInput);
+        $numbers = explode(',', $recipientsInput);
+        
+        foreach ($numbers as $number) {
+            $cleanNumber = trim($number);
+            if (!empty($cleanNumber)) {
+                $recipients[] = $cleanNumber;
+            }
+        }
+    } else {
+        // Use sample recipients
+        $recipients = array_keys($sampleRecipients);
+    }
+    
+    // Validate
+    if (empty($message)) {
+        $error = "Please enter a message";
+    } elseif (empty($recipients)) {
+        $error = "Please enter at least one recipient";
+    } elseif (!isset($config[$provider])) {
+        $error = "Invalid SMS provider selected";
+    } elseif (!$config[$provider]['enabled']) {
+        $error = "Selected provider is not configured. Please update config section.";
+    } else {
+        // Send bulk SMS
+        switch ($provider) {
+            case 'twilio':
+                $results = sendViaTwilio($recipients, $message, $config[$provider]);
+                break;
+                
+            case 'africas_talking':
+                $results = sendViaAfricasTalking($recipients, $message, $config[$provider]);
+                break;
+                
+            case 'hubtel':
+                $results = sendViaHubtel($recipients, $message, $config[$provider]);
+                break;
+                
+            case 'generic':
+                $results = sendViaGenericAPI($recipients, $message, $config[$provider]);
+                break;
+        }
+        
+        // Count results
+        foreach ($results as $result) {
+            if ($result['status'] === 'success') {
+                $successCount++;
+            } else {
+                $failedCount++;
+            }
+        }
+    }
+}
+
+/**
+ * Send SMS via Twilio
+ */
+function sendViaTwilio($recipients, $message, $config) {
+    $results = [];
+    $url = "https://api.twilio.com/2010-04-01/Accounts/{$config['account_sid']}/Messages.json";
+    
+    foreach ($recipients as $to) {
+        $postData = [
+            'To' => $to,
+            'From' => $config['from_number'],
+            'Body' => $message
+        ];
+        
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postData));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_USERPWD, "{$config['account_sid']}:{$config['auth_token']}");
+        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+        
+        if ($httpCode == 201) {
+            $results[] = [
+                'to' => $to,
+                'status' => 'success',
+                'message_id' => json_decode($response)->sid ?? 'N/A'
+            ];
+        } else {
+            $results[] = [
+                'to' => $to,
+                'status' => 'failed',
+                'error' => $error ?: "HTTP {$httpCode}: " . ($response ?: 'Unknown error')
+            ];
+        }
+        
+        // Rate limiting: Twilio allows ~1 SMS per second on starter accounts
+        sleep(1);
+    }
+    
+    return $results;
+}
+
+/**
+ * Send SMS via Africa's Talking
+ */
+function sendViaAfricasTalking($recipients, $message, $config) {
+    $results = [];
+    
+    // Africa's Talking requires numbers in international format without '+'
+    $cleanRecipients = array_map(function($num) {
+        return ltrim($num, '+');
+    }, $recipients);
+    
+    $postData = [
+        'username' => $config['username'],
+        'to' => implode(',', $cleanRecipients),
+        'message' => $message,
+        'from' => $config['from']
+    ];
+    
+    $url = 'https://api.africastalking.com/version1/messaging';
+    
+    $headers = [
+        'Accept: application/json',
+        'Content-Type: application/x-www-form-urlencoded',
+        'apiKey: ' . $config['api_key']
+    ];
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postData));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    $responseData = json_decode($response, true);
+    
+    if ($httpCode == 201 && isset($responseData['SMSMessageData']['Recipients'])) {
+        foreach ($responseData['SMSMessageData']['Recipients'] as $recipient) {
+            $results[] = [
+                'to' => '+' . $recipient['number'],
+                'status' => $recipient['status'] == 'Success' ? 'success' : 'failed',
+                'message_id' => $recipient['messageId'] ?? 'N/A',
+                'cost' => $recipient['cost'] ?? 'N/A'
+            ];
+        }
+    } else {
+        // Bulk failed, log individual errors
+        foreach ($recipients as $to) {
+            $results[] = [
+                'to' => $to,
+                'status' => 'failed',
+                'error' => $responseData['SMSMessageData']['Message'] ?? 'Unknown error'
+            ];
+        }
+    }
+    
+    return $results;
+}
+
+/**
+ * Send SMS via Hubtel
+ */
+function sendViaHubtel($recipients, $message, $config) {
+    $results = [];
+    $url = 'https://api.hubtel.com/v1/messages';
+    
+    // Hubtel Basic Auth
+    $auth = base64_encode("{$config['client_id']}:{$config['client_secret']}");
+    
+    foreach ($recipients as $to) {
+        $postData = [
+            'From' => $config['sender_id'],
+            'To' => $to,
+            'Content' => $message,
+            'RegisteredDelivery' => true
+        ];
+        
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($postData));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Authorization: Basic ' . $auth,
+            'Content-Type: application/json',
+            'Accept: application/json'
+        ]);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        
+        $responseData = json_decode($response, true);
+        
+        if ($httpCode == 201 || $httpCode == 200) {
+            $results[] = [
+                'to' => $to,
+                'status' => 'success',
+                'message_id' => $responseData['MessageId'] ?? 'N/A'
+            ];
+        } else {
+            $results[] = [
+                'to' => $to,
+                'status' => 'failed',
+                'error' => $responseData['Message'] ?? "HTTP {$httpCode}"
+            ];
+        }
+        
+        // Small delay to avoid rate limiting
+        usleep(500000); // 0.5 seconds
+    }
+    
+    return $results;
+}
+
+/**
+ * Send SMS via Generic HTTP API
+ */
+function sendViaGenericAPI($recipients, $message, $config) {
+    $results = [];
+    
+    foreach ($recipients as $to) {
+        // Build URL or POST data based on configuration
+        if ($config['method'] === 'GET') {
+            $url = str_replace(
+                ['{TO}', '{MESSAGE}', '{APIKEY}'],
+                [urlencode($to), urlencode($message), $config['api_key']],
+                $config['url']
+            );
+            
+            $ch = curl_init();
+            curl_setopt($ch, CURLOPT_URL, $url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        } else {
+            // POST method
+            $postData = [
+                'to' => $to,
+                'message' => $message,
+                'apikey' => $config['api_key']
+                // Add other required parameters as needed
+            ];
+            
+            $ch = curl_init();
+            curl_setopt($ch, CURLOPT_URL, $config['url']);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postData));
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        }
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+        
+        // You'll need to adjust this based on your provider's response
+        if ($httpCode == 200) {
+            $results[] = [
+                'to' => $to,
+                'status' => 'success',
+                'response' => $response
+            ];
+        } else {
+            $results[] = [
+                'to' => $to,
+                'status' => 'failed',
+                'error' => $error ?: "HTTP {$httpCode}"
+            ];
+        }
+        
+        // Delay to prevent overwhelming the API
+        usleep(300000); // 0.3 seconds
+    }
+    
+    return $results;
+}
+
+/**
+ * Format phone number to international format
+ */
+function formatPhoneNumber($number) {
+    $number = preg_replace('/[^0-9]/', '', $number);
+    
+    // If number starts with 0, assume Ghana number
+    if (substr($number, 0, 1) === '0') {
+        $number = '233' . substr($number, 1);
+    }
+    
+    // If number doesn't start with country code, add Ghana code
+    if (substr($number, 0, 2) !== '23') {
+        $number = '233' . $number;
+    }
+    
+    return '+' . $number;
+}
+
+/**
+ * Load recipients from CSV file
+ */
+function loadRecipientsFromCSV($filePath) {
+    $recipients = [];
+    
+    if (($handle = fopen($filePath, 'r')) !== FALSE) {
+        while (($data = fgetcsv($handle, 1000, ',')) !== FALSE) {
+            if (isset($data[0]) && !empty(trim($data[0]))) {
+                $recipients[] = formatPhoneNumber(trim($data[0]));
+            }
+        }
+        fclose($handle);
+    }
+    
+    return $recipients;
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bulk SMS Sender</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #FF6B00, #003366);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+        
+        .content {
+            display: flex;
+            min-height: 600px;
+        }
+        
+        .form-section {
+            flex: 1;
+            padding: 30px;
+            background: #f8f9fa;
+            border-right: 1px solid #e0e0e0;
+        }
+        
+        .results-section {
+            flex: 1;
+            padding: 30px;
+            background: white;
+            overflow-y: auto;
+            max-height: 600px;
+        }
+        
+        .form-group {
+            margin-bottom: 25px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+        }
+        
+        select, textarea, input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        select:focus, textarea:focus, input:focus {
+            outline: none;
+            border-color: #FF6B00;
+        }
+        
+        textarea {
+            min-height: 100px;
+            resize: vertical;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        .recipients-hint {
+            font-size: 14px;
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .btn {
+            background: #FF6B00;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+            transition: background 0.3s;
+        }
+        
+        .btn:hover {
+            background: #e05e00;
+        }
+        
+        .btn:disabled {
+            background: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        .stats {
+            background: #f0f7ff;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-around;
+            text-align: center;
+        }
+        
+        .stat-box {
+            flex: 1;
+        }
+        
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+        }
+        
+        .stat-success { color: #10b981; }
+        .stat-failed { color: #ef4444; }
+        .stat-total { color: #3b82f6; }
+        
+        .result-item {
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 8px;
+            border-left: 5px solid;
+        }
+        
+        .result-success {
+            background: #d1fae5;
+            border-left-color: #10b981;
+        }
+        
+        .result-failed {
+            background: #fee2e2;
+            border-left-color: #ef4444;
+        }
+        
+        .phone-number {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .error-message {
+            background: #fee2e2;
+            color: #ef4444;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        .success-message {
+            background: #d1fae5;
+            color: #10b981;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            color: #666;
+            border-top: 1px solid #e0e0e0;
+        }
+        
+        .sample-recipients {
+            background: #f0f9ff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        @media (max-width: 768px) {
+            .content {
+                flex-direction: column;
+            }
+            
+            .form-section {
+                border-right: none;
+                border-bottom: 1px solid #e0e0e0;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📱 Bulk SMS Sender</h1>
+            <p>Send SMS to multiple recipients at once</p>
+        </header>
+        
+        <div class="content">
+            <div class="form-section">
+                <form method="POST" action="">
+                    <div class="form-group">
+                        <label for="provider">SMS Provider</label>
+                        <select name="provider" id="provider" required>
+                            <option value="generic" <?= ($_POST['provider'] ?? '') === 'generic' ? 'selected' : '' ?>>Generic HTTP API</option>
+                            <option value="twilio" <?= ($_POST['provider'] ?? '') === 'twilio' ? 'selected' : '' ?>>Twilio</option>
+                            <option value="africas_talking" <?= ($_POST['provider'] ?? '') === 'africas_talking' ? 'selected' : '' ?>>Africa's Talking</option>
+                            <option value="hubtel" <?= ($_POST['provider'] ?? '') === 'hubtel' ? 'selected' : '' ?>>Hubtel</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="message">Message</label>
+                        <textarea 
+                            name="message" 
+                            id="message" 
+                            placeholder="Type your SMS message here..." 
+                            required
+                            maxlength="1600"
+                        ><?= htmlspecialchars($_POST['message'] ?? '') ?></textarea>
+                        <div class="recipients-hint">
+                            Maximum 1600 characters. Current: <span id="charCount">0</span>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="recipients">Recipient Phone Numbers</label>
+                        <textarea 
+                            name="recipients" 
+                            id="recipients" 
+                            placeholder="Enter phone numbers (one per line, or comma separated)
+Example:
++233244123456
++233274987654
+0244123456"
+                            rows="8"
+                        ><?= htmlspecialchars($_POST['recipients'] ?? '') ?></textarea>
+                        <div class="recipients-hint">
+                            Enter phone numbers in international format (e.g., +233244123456) or local format (0244123456)
+                        </div>
+                    </div>
+                    
+                    <div class="sample-recipients">
+                        <strong>Sample Recipients (will be used if field is empty):</strong><br>
+                        <?php foreach ($sampleRecipients as $number => $name): ?>
+                            <div><?= htmlspecialchars($name) ?>: <?= htmlspecialchars($number) ?></div>
+                        <?php endforeach; ?>
+                    </div>
+                    
+                    <?php if (isset($error)): ?>
+                        <div class="error-message">
+                            ❌ <?= htmlspecialchars($error) ?>
+                        </div>
+                    <?php endif; ?>
+                    
+                    <button type="submit" class="btn" id="sendBtn">
+                        <?php if ($_SERVER['REQUEST_METHOD'] === 'POST'): ?>
+                            📤 Sending... Please wait
+                        <?php else: ?>
+                            🚀 Send Bulk SMS
+                        <?php endif; ?>
+                    </button>
+                </form>
+            </div>
+            
+            <div class="results-section">
+                <h2>Results</h2>
+                
+                <?php if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($error)): ?>
+                    <div class="stats">
+                        <div class="stat-box">
+                            <div class="stat-value stat-total"><?= count($results) ?></div>
+                            <div>Total</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value stat-success"><?= $successCount ?></div>
+                            <div>Successful</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value stat-failed"><?= $failedCount ?></div>
+                            <div>Failed</div>
+                        </div>
+                    </div>
+                    
+                    <?php if ($successCount > 0): ?>
+                        <div class="success-message">
+                            ✅ Successfully sent <?= $successCount ?> message(s)
+                        </div>
+                    <?php endif; ?>
+                    
+                    <?php foreach ($results as $result): ?>
+                        <div class="result-item <?= $result['status'] === 'success' ? 'result-success' : 'result-failed' ?>">
+                            <div class="phone-number"><?= htmlspecialchars($result['to']) ?></div>
+                            <div>
+                                <strong>Status:</strong> 
+                                <?= $result['status'] === 'success' ? '✅ Success' : '❌ Failed' ?>
+                            </div>
+                            <?php if ($result['status'] === 'success'): ?>
+                                <div><strong>Message ID:</strong> <?= htmlspecialchars($result['message_id'] ?? 'N/A') ?></div>
+                                <?php if (isset($result['cost'])): ?>
+                                    <div><strong>Cost:</strong> <?= htmlspecialchars($result['cost']) ?></div>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                <div><strong>Error:</strong> <?= htmlspecialchars($result['error'] ?? 'Unknown error') ?></div>
+                            <?php endif; ?>
+                        </div>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <div style="text-align: center; padding: 50px 20px; color: #666;">
+                        <div style="font-size: 4rem; margin-bottom: 20px;">📨</div>
+                        <h3>No SMS sent yet</h3>
+                        <p>Fill out the form and click "Send Bulk SMS" to get started.</p>
+                        <p>Your results will appear here.</p>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>Bulk SMS Sender • Works with multiple SMS providers • Configure your API credentials in the config section</p>
+            <p><strong>Note:</strong> Remember to enable and configure your chosen provider in the PHP code</p>
+        </div>
+    </div>
+
+    <script>
+        // Character count for message
+        const messageInput = document.getElementById('message');
+        const charCount = document.getElementById('charCount');
+        const sendBtn = document.getElementById('sendBtn');
+        
+        messageInput.addEventListener('input', function() {
+            charCount.textContent = this.value.length;
+        });
+        
+        // Initialize character count
+        charCount.textContent = messageInput.value.length;
+        
+        // Disable button during form submission to prevent double submission
+        document.querySelector('form').addEventListener('submit', function() {
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '⏳ Sending SMS... Please wait (this may take a moment)';
+        });
+        
+        // Auto-format phone numbers on blur
+        document.getElementById('recipients').addEventListener('blur', function(e) {
+            const numbers = this.value.split(/[\n,;]+/).map(num => num.trim()).filter(num => num);
+            const formatted = numbers.map(num => {
+                // Remove all non-digits
+                let clean = num.replace(/\D/g, '');
+                
+                // If number starts with 0, assume Ghana and add +233
+                if (clean.startsWith('0') && clean.length === 10) {
+                    return '+233' + clean.substring(1);
+                }
+                
+                // If number is 9 digits and starts with 2-9, assume Ghana without leading 0
+                if (clean.length === 9 && /^[2-9]/.test(clean)) {
+                    return '+233' + clean;
+                }
+                
+                // If number is 12 digits and starts with 233
+                if (clean.length === 12 && clean.startsWith('233')) {
+                    return '+' + clean;
+                }
+                
+                // Return original if we can't format
+                return num;
+            });
+            
+            this.value = formatted.join('\n');
+        });
+    </script>
+</body>
+</html>
